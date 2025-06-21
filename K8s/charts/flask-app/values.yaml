@@ -1,0 +1,47 @@
+replicaCount: 2
+
+image:
+  repository: kandukurisaikrishna/flask-app
+  tag: 70
+  
+  pullPolicy: IfNotPresent
+
+namespace: default
+
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn:arn:aws:iam::527111401854:role/EKSClusterRole 
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 5000
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+
+livenessProbe:
+  path: /
+  port: 5000
+  initialDelaySeconds: 15
+  periodSeconds: 10
+
+readinessProbe:
+  path: /
+  port: 5000
+  initialDelaySeconds: 5
+  periodSeconds: 5
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+  path: /
+  pathType: Prefix
+  servicePort: 80
