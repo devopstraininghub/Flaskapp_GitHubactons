@@ -1,0 +1,222 @@
+name: Flask CI/CD Pipeline
+
+on:
+  push:
+    branches: main
+
+permissions:
+  contents: write
+  security-events: write
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flask pytest
+
+      - name: Run tests
+        run: |
+          pytest --version  # Replace with pytest tests/test_app.py
+
+  sonarqube-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for SonarQube to analyze git history
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@v2
+        with:
+          args: >
+            -Dsonar.projectKey=SanthoshVari_Devops-task-sonar
+            -Dsonar.organization=santhoshvari
+            -Dsonar.sources=.
+            -Dsonar.projectVersion=${{ github.run_number }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      
+      - name: Upload SonarQube report to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          aws s3 cp .scannerwork/report-task.txt s3://${{ secrets.S3_BUCKET }}/sonarqube-report-${{ github.run_number }}.txt
+
+  trivy-fs-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          scan-type: 'fs'
+          format: 'sarif'
+          output: 'trivy-fs-results-${{ github.run_number }}.sarif'
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: true
+
+      - name: Upload Trivy filesystem scan results to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          aws s3 cp trivy-fs-results-${{ github.run_number }}.sarif s3://${{ secrets.S3_BUCKET }}/trivy-fs-results-${{ github.run_number }}.sarif
+
+      - name: Upload Trivy filesystem scan results to GitHub
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-fs-results-${{ github.run_number }}.sarif'
+
+  
+
+      
+
+  docker-build-push:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/flask-app:${{ github.run_number }}
+
+      - name: Run Trivy image scan
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: ${{ secrets.DOCKER_USERNAME }}/flask-app:${{ github.run_number }}
+          format: 'json'
+          output: 'trivy-image-results-${{ github.run_number }}.json'
+          severity: 'HIGH,CRITICAL'
+          exit-code: 0
+
+      - name: Upload Trivy image scan results to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          aws s3 cp trivy-image-results-${{ github.run_number }}.json s3://${{ secrets.S3_BUCKET }}/trivy-image-results-${{ github.run_number }}.json
+  archive-s3-reports:
+    runs-on: ubuntu-latest
+    needs: [sonarqube-scan, trivy-fs-scan]
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Invoke Lambda Function
+        run: |
+          aws lambda invoke \
+            --function-name archive-old-reports \
+            --payload '{"bucket_name": "${{ secrets.S3_BUCKET }}"}' \
+            --cli-binary-format raw-in-base64-out \
+            response.json
+          cat response.json
+  ArgoCD:
+    runs-on: ubuntu-latest
+    needs: docker-build-push
+    steps:    
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Update image tag in manifest
+        run: |
+          pwd && ls -R
+          sed -i "s/^ *tag: .*/  tag: ${{ github.run_number }}/" K8s/charts/flask-app/values.yaml
+
+          cat K8s/charts/flask-app/values.yaml
+
+      - name: Commit updated YAML to repo [ci skip]
+        run: |
+          git config user.name "SanthoshVari"
+          git config user.email "santhosh.devopscloud@gmail.com"
+          git add . 
+          git commit -m "Update image tag to ${{ github.run_number }} [ci skip]"
+          git push 
+  send-email-notification:
+    runs-on: ubuntu-latest
+    needs: [sonarqube-scan, trivy-fs-scan, docker-build-push,ArgoCD]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download reports from S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          aws s3 cp s3://${{ secrets.S3_BUCKET }}/sonarqube-report-${{ github.run_number }}.txt sonarqube-report-${{ github.run_number }}.txt
+          aws s3 cp s3://${{ secrets.S3_BUCKET }}/trivy-fs-results-${{ github.run_number }}.sarif trivy-fs-results-${{ github.run_number }}.sarif
+         
+          aws s3 cp s3://${{ secrets.S3_BUCKET }}/trivy-image-results-${{ github.run_number }}.json trivy-image-results-${{ github.run_number }}.json
+
+      - name: Send email with scan reports
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: 'CI/CD Pipeline Report - Flask App Build #${{ github.run_number }}'
+          to: ${{ secrets.TO_EMAIL }}
+          from: GitHub Actions <no-reply@github.com>
+          body: |
+            CI/CD Pipeline completed for Flask App (Build #${{ github.run_number }}).
+            Commit Message: ${{ github.event.head_commit.message }}
+            
+            - SonarQube Scan: ${{ needs.sonarqube-scan.result }}
+            - Trivy Filesystem Scan: ${{ needs.trivy-fs-scan.result }}
+           
+           
+            - Docker Build and Image Scan: ${{ needs.docker-build-push.result }}
+            See attached reports for details.
+          attachments: |
+            sonarqube-report-${{ github.run_number }}.txt,
+            trivy-fs-results-${{ github.run_number }}.sarif,
+            trivy-image-results-${{ github.run_number }}.json
+
+    
+
+  
