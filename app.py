@@ -26,7 +26,7 @@ def home():
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Flask Time App by Santosh</title>
+            <title>Flask Time App by SantoshV</title>
             <script>
                 function updateTime() {{
                     const now = new Date();
